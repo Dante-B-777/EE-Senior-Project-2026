@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+import serial
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+
+PORT = "/dev/ttyACM0"
+BAUD = 115200
+
+# Tuning:
+MAX_CMD = 600        # -1000..1000 allowed by STM32
+MAX_LIN = 0.6        # m/s that maps to MAX_CMD
+MAX_ANG = 1.5        # rad/s that maps to MAX_CMD
+TRACK = 0.40         # meters (effective wheel track)
+WHEEL_R = 0.08       # meters (wheel radius)
+
+def clamp(x, lo, hi): return lo if x < lo else hi if x > hi else x
+
+class CmdVelToSerial(Node):
+    def __init__(self):
+        super().__init__('cmdvel_to_serial')
+        self.ser = serial.Serial(PORT, BAUD, timeout=0.02)
+        self.last_msg_time = self.get_clock().now()
+        self.sub = self.create_subscription(Twist, '/cmd_vel', self.cb, 10)
+        self.timer = self.create_timer(0.05, self.watchdog)  # 20 Hz
+
+        self.get_logger().info(f"Serial open: {PORT} @ {BAUD}")
+
+    def write_m(self, fl, fr, rl, rr):
+        line = f"M {fl} {fr} {rl} {rr}\n"
+        self.ser.write(line.encode('ascii'))
+
+    def stop(self):
+        self.ser.write(b"X\n")
+
+    def cb(self, msg: Twist):
+        self.last_msg_time = self.get_clock().now()
+
+        v = msg.linear.x    # m/s
+        w = msg.angular.z   # rad/s
+
+        # Differential drive: wheel linear velocities
+        v_l = v + (w * TRACK / 2.0)
+        v_r = v - (w * TRACK / 2.0)
+
+        # Convert to normalized command
+        # Map v_l,v_r into [-MAX_CMD..MAX_CMD] by scaling to MAX_LIN
+        left_cmd  = int(clamp((v_l / MAX_LIN) * MAX_CMD, -MAX_CMD, MAX_CMD))
+        right_cmd = int(clamp((v_r / MAX_LIN) * MAX_CMD, -MAX_CMD, MAX_CMD))
+
+        self.write_m(left_cmd, right_cmd, left_cmd, right_cmd)
+
+    def watchdog(self):
+        # if no cmd_vel recently, stop
+        age = (self.get_clock().now() - self.last_msg_time).nanoseconds / 1e9
+        if age > 0.25:
+            self.stop()
+
+def main():
+    rclpy.init()
+    node = CmdVelToSerial()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop()
+        node.ser.close()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
