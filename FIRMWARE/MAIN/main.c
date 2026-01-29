@@ -114,6 +114,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static Odom4_t odom;
+    static uint32_t last_tx = 0;
+    Odom4_Update(&odom, HAL_GetTick());
+    if (HAL_GetTick() - last_tx >= 50) { // 20 Hz
+      last_tx = HAL_GetTick();
+      char line[96];
+      int n = Odom4_FormatTelemetry(&odom, line, sizeof(line));
+      if (n > 0) {
+        HAL_UART_Transmit(&hlpuart1, (uint8_t*)line, (uint16_t)n, 5);
+      }
+    }
     Wheels4_Task(HAL_GetTick());
     HAL_Delay(5);
   }
