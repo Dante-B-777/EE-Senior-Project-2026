@@ -3,47 +3,28 @@
 
 #include "stm32l4xx_hal.h"
 #include <stdint.h>
-#include <stdbool.h>
 
 typedef enum {
-    W_FL = 0,   // Front Left
-    W_FR = 1,   // Front Right
-    W_RL = 2,   // Rear Left
-    W_RR = 3    // Rear Right
+  W_FL = 0,
+  W_FR = 1,
+  W_RL = 2,
+  W_RR = 3
 } WheelIndex;
 
-typedef struct {
-    TIM_TypeDef *pwm_tim;
-    uint8_t      pwm_ch;      // 1..4 (maps to CCR1..CCR4)
+void Wheels4_Init(UART_HandleTypeDef *huart);
 
-    GPIO_TypeDef *dir_port;
-    uint16_t      dir_pin;
-    bool          dir_fwd_is_low;  // match your driver wiring
+void Wheels4_ConfigAll(
+    TIM_HandleTypeDef *htim2,
+    GPIO_TypeDef *dirFL_port, uint16_t dirFL_pin,
+    GPIO_TypeDef *dirFR_port, uint16_t dirFR_pin,
+    GPIO_TypeDef *dirRL_port, uint16_t dirRL_pin,
+    GPIO_TypeDef *dirRR_port, uint16_t dirRR_pin);
 
-    TIM_TypeDef *enc_tim;
+void Wheels4_OnRxByte(uint8_t b);
+void Wheels4_Task(uint32_t now_ms);
 
-    // extended count state
-    uint16_t enc_prev;
-    int32_t  enc_acc;
-} Wheel_t;
-
-extern Wheel_t g_wheels[4];
-
-/* Init */
-void Wheels_GPIO_Init_All(void);
-void Wheels_PWM_TIM2_Init_20kHz_All4(void);
-void Wheels_Enc_Init_All(void);
-
-/* Per-wheel control */
-void Wheel_SetSignedSpeed(WheelIndex w, int16_t cmd); // -1000..+1000
-int32_t Wheel_GetCount32(WheelIndex w);
-
-/* High-level robot motions */
-void Drive_Stop(void);
-void Drive_Forward(int16_t cmd);
-void Drive_Reverse(int16_t cmd);
-void Drive_TurnLeft(int16_t cmd);
-void Drive_TurnRight(int16_t cmd);
+void Wheel_SetSignedSpeed(WheelIndex idx, int16_t cmd);
+void Wheels4_SetAll(int16_t fl, int16_t fr, int16_t rl, int16_t rr);
+void Wheels4_Stop(void);
 
 #endif
-
