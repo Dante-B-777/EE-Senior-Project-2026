@@ -1,219 +1,182 @@
 #include "wheels4.h"
+#include <string.h>
+#include <stdio.h>
 
-/* =========================
-   Example pin mapping
-   =========================
-   PWM (TIM2): PA0/PA1/PA2/PA3 -> CH1..CH4
-   DIR pins : PB0/PB1/PB2/PB10
+#define LINE_BUF_SZ 64
+#define DRIVE_TIMEOUT_MS 250
 
-   Encoders:
-     W_FL: TIM3 on PA6/PA7 (CH1/CH2)
-     W_FR: TIM4 on PB6/PB7
-     W_RL: TIM1 on PA8/PA9
-     W_RR: TIM8 on PC6/PC7
-*/
+typedef struct {
+  TIM_HandleTypeDef *htim;
+  uint32_t ch;
+  GPIO_TypeDef *dir_port;
+  uint16_t dir_pin;
+  // Your earlier behavior: forward = DIR low
+  uint8_t dir_fwd_is_low;
+  int16_t cmd;
+} Motor4_t;
 
-Wheel_t g_wheels[4] = {
-    // W_FL
-    { TIM2, 1, GPIOB, GPIO_PIN_0,  true,  TIM3, 0, 0 },
-    // W_FR
-    { TIM2, 2, GPIOB, GPIO_PIN_1,  true,  TIM4, 0, 0 },
-    // W_RL
-    { TIM2, 3, GPIOB, GPIO_PIN_2,  true,  TIM1, 0, 0 },
-    // W_RR
-    { TIM2, 4, GPIOB, GPIO_PIN_10, true,  TIM8, 0, 0 },
-};
+static UART_HandleTypeDef *g_huart = NULL;
+static Motor4_t g_m[4];
 
-static inline void pwm_set_ccr(TIM_TypeDef *tim, uint8_t ch, uint32_t val)
+static volatile char g_line[LINE_BUF_SZ];
+static volatile int  g_len = 0;
+static volatile int  g_ready = 0;
+
+static uint32_t g_last_ms = 0;
+
+static int clamp_i(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+static uint32_t uabs_i32(int32_t x) { return (x < 0) ? (uint32_t)(-x) : (uint32_t)x; }
+
+static void motor_apply(Motor4_t *m, int16_t cmd)
 {
-    if (ch == 1) tim->CCR1 = val;
-    else if (ch == 2) tim->CCR2 = val;
-    else if (ch == 3) tim->CCR3 = val;
-    else if (ch == 4) tim->CCR4 = val;
+  cmd = (int16_t)clamp_i(cmd, -1000, 1000);
+  m->cmd = cmd;
+
+  uint8_t forward = (cmd >= 0) ? 1 : 0;
+
+  // DIR write
+  // if forward means DIR low, then "forward=1" -> write RESET
+  GPIO_PinState dir_state;
+  if (m->dir_fwd_is_low) {
+    dir_state = forward ? GPIO_PIN_RESET : GPIO_PIN_SET;
+  } else {
+    dir_state = forward ? GPIO_PIN_SET : GPIO_PIN_RESET;
+  }
+  HAL_GPIO_WritePin(m->dir_port, m->dir_pin, dir_state);
+
+  // PWM duty
+  uint32_t mag = uabs_i32((int32_t)cmd);
+  if (mag > 1000) mag = 1000;
+
+  uint32_t arr = __HAL_TIM_GET_AUTORELOAD(m->htim);
+  uint32_t ccr = ((arr + 1u) * mag) / 1000u;
+  if (ccr > arr) ccr = arr;
+
+  __HAL_TIM_SET_COMPARE(m->htim, m->ch, ccr);
 }
 
-static inline void dir_write(Wheel_t *w, bool forward)
+void Wheels4_Init(UART_HandleTypeDef *huart)
 {
-    // forward = DIR low (like your current PB0 behavior) if dir_fwd_is_low == true
-    bool set_pin = (w->dir_fwd_is_low) ? (!forward) : (forward);
-    if (set_pin) w->dir_port->BSRR = w->dir_pin;
-    else         w->dir_port->BRR  = w->dir_pin;
+  g_huart = huart;
+
+  memset((void*)g_line, 0, sizeof(g_line));
+  g_len = 0;
+  g_ready = 0;
+
+  for (int i=0;i<4;i++) {
+    g_m[i].htim = NULL;
+    g_m[i].ch = 0;
+    g_m[i].dir_port = NULL;
+    g_m[i].dir_pin = 0;
+    g_m[i].dir_fwd_is_low = 1; // match your original PB0 behavior
+    g_m[i].cmd = 0;
+  }
+
+  g_last_ms = HAL_GetTick();
 }
 
-/* ---------------- GPIO init (DIR + PWM pins + encoder pins) ----------------
-   NOTE: This is intentionally a TEMPLATE:
-   - You must set MODER/AFR for each PWM + encoder pin you choose.
-   - Below we only show DIR pins + TIM2 PWM pins as an example.
-*/
-void Wheels_GPIO_Init_All(void)
+void Wheels4_ConfigAll(
+    TIM_HandleTypeDef *htim2,
+    GPIO_TypeDef *dirFL_port, uint16_t dirFL_pin,
+    GPIO_TypeDef *dirFR_port, uint16_t dirFR_pin,
+    GPIO_TypeDef *dirRL_port, uint16_t dirRL_pin,
+    GPIO_TypeDef *dirRR_port, uint16_t dirRR_pin)
 {
-    RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN
-                 |  RCC_AHB2ENR_GPIOBEN
-                 |  RCC_AHB2ENR_GPIOCEN;
+  // PWM channels on TIM2
+  g_m[W_FL] = (Motor4_t){ htim2, TIM_CHANNEL_1, dirFL_port, dirFL_pin, 1, 0 };
+  g_m[W_FR] = (Motor4_t){ htim2, TIM_CHANNEL_2, dirFR_port, dirFR_pin, 1, 0 };
+  g_m[W_RL] = (Motor4_t){ htim2, TIM_CHANNEL_3, dirRL_port, dirRL_pin, 1, 0 };
+  g_m[W_RR] = (Motor4_t){ htim2, TIM_CHANNEL_4, dirRR_port, dirRR_pin, 1, 0 };
 
-    /* DIR pins as outputs */
-    // PB0, PB1, PB2, PB10
-    GPIOB->MODER &= ~(3U<<(0*2));  GPIOB->MODER |=  (1U<<(0*2));
-    GPIOB->MODER &= ~(3U<<(1*2));  GPIOB->MODER |=  (1U<<(1*2));
-    GPIOB->MODER &= ~(3U<<(2*2));  GPIOB->MODER |=  (1U<<(2*2));
-    GPIOB->MODER &= ~(3U<<(10*2)); GPIOB->MODER |=  (1U<<(10*2));
+  // Start PWM on all 4 channels
+  HAL_TIM_PWM_Start(htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(htim2, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(htim2, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(htim2, TIM_CHANNEL_4);
 
-    /* Default forward (DIR low) */
-    GPIOB->BRR = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_10;
-
-    /* TIM2 PWM pins: PA0..PA3 AF1 */
-    for (int pin = 0; pin <= 3; pin++) {
-        GPIOA->MODER &= ~(3U << (pin*2));
-        GPIOA->MODER |=  (2U << (pin*2));      // AF
-        GPIOA->AFR[0] &= ~(0xFU << (pin*4));
-        GPIOA->AFR[0] |=  (0x1U << (pin*4));   // AF1 TIM2
-    }
-
-    // Encoder pins: configure similarly (AF mappings depend on your chosen timers/pins)
-    // Configure PA6/PA7 AF2 for TIM3, PB6/PB7 AF2 for TIM4, etc.
+  Wheels4_Stop();
 }
 
-/* ---------------- TIM2 PWM 20kHz with 4 channels ---------------- */
-void Wheels_PWM_TIM2_Init_20kHz_All4(void)
+void Wheels4_OnRxByte(uint8_t b)
 {
-    RCC->APB1ENR1 |= RCC_APB1ENR1_TIM2EN;
+  char c = (char)b;
+  if (g_ready) return;
+  if (c == '\r') return;
 
-    TIM2->CR1 &= ~TIM_CR1_CEN;
-    TIM2->PSC = 0;
-    TIM2->ARR = 199;              // 4MHz/200 = 20kHz
-
-    // CH1 PWM1
-    TIM2->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_OC1M);
-    TIM2->CCMR1 |=  (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
-
-    // CH2 PWM1
-    TIM2->CCMR1 &= ~(TIM_CCMR1_CC2S | TIM_CCMR1_OC2M);
-    TIM2->CCMR1 |=  (6U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
-
-    // CH3 PWM1
-    TIM2->CCMR2 &= ~(TIM_CCMR2_CC3S | TIM_CCMR2_OC3M);
-    TIM2->CCMR2 |=  (6U << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
-
-    // CH4 PWM1
-    TIM2->CCMR2 &= ~(TIM_CCMR2_CC4S | TIM_CCMR2_OC4M);
-    TIM2->CCMR2 |=  (6U << TIM_CCMR2_OC4M_Pos) | TIM_CCMR2_OC4PE;
-
-    TIM2->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E | TIM_CCER_CC4E;
-
-    TIM2->CCR1 = 0; TIM2->CCR2 = 0; TIM2->CCR3 = 0; TIM2->CCR4 = 0;
-
-    TIM2->CR1 |= TIM_CR1_ARPE;
-    TIM2->EGR |= TIM_EGR_UG;
-    TIM2->CR1 |= TIM_CR1_CEN;
+  if (c == '\n' || g_len >= (LINE_BUF_SZ - 1)) {
+    g_line[g_len] = '\0';
+    g_ready = 1;
+    return;
+  }
+  g_line[g_len++] = c;
 }
 
-/* ---------------- Encoder init helper (same as your TIM3 setup) ---------------- */
-static void encoder_init(TIM_TypeDef *tim, volatile uint32_t *rcc_en_reg, uint32_t rcc_en_mask)
-{
-    *rcc_en_reg |= rcc_en_mask;
-
-    tim->CR1 &= ~TIM_CR1_CEN;
-    tim->PSC = 0;
-    tim->ARR = 0xFFFF;
-
-    tim->SMCR &= ~TIM_SMCR_SMS;
-    tim->SMCR |=  (3U << TIM_SMCR_SMS_Pos);  // encoder mode 3
-
-    tim->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
-    tim->CCMR1 |=  (1U << TIM_CCMR1_CC1S_Pos);
-    tim->CCMR1 |=  (1U << TIM_CCMR1_CC2S_Pos);
-
-    tim->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);
-    tim->CCER |= (TIM_CCER_CC1E | TIM_CCER_CC2E);
-
-    tim->CNT = 0;
-    tim->CR1 |= TIM_CR1_CEN;
-}
-
-void Wheels_Enc_Init_All(void)
-{
-    // TIM3 (APB1ENR1)
-    encoder_init(TIM3, &RCC->APB1ENR1, RCC_APB1ENR1_TIM3EN);
-    // TIM4 (APB1ENR1)
-    encoder_init(TIM4, &RCC->APB1ENR1, RCC_APB1ENR1_TIM4EN);
-    // TIM1 (APB2ENR)
-    encoder_init(TIM1, &RCC->APB2ENR,  RCC_APB2ENR_TIM1EN);
-    // TIM8 (APB2ENR)
-    encoder_init(TIM8, &RCC->APB2ENR,  RCC_APB2ENR_TIM8EN);
-}
-
-/* ---------------- Per-wheel speed ---------------- */
 void Wheel_SetSignedSpeed(WheelIndex idx, int16_t cmd)
 {
-    Wheel_t *w = &g_wheels[idx];
-
-    if (cmd > 1000)  cmd = 1000;
-    if (cmd < -1000) cmd = -1000;
-
-    bool forward = (cmd >= 0);
-    if (cmd < 0) cmd = (int16_t)(-cmd);
-
-    dir_write(w, forward);
-
-    uint32_t duty = ((uint32_t)cmd * (w->pwm_tim->ARR + 1U)) / 1000U;
-    if (duty > w->pwm_tim->ARR) duty = w->pwm_tim->ARR;
-
-    pwm_set_ccr(w->pwm_tim, w->pwm_ch, duty);
+  if ((int)idx < 0 || (int)idx > 3) return;
+  if (!g_m[idx].htim || !g_m[idx].dir_port) return;
+  motor_apply(&g_m[idx], cmd);
 }
 
-/* ---------------- 32-bit wrap-safe encoder count per wheel ---------------- */
-int32_t Wheel_GetCount32(WheelIndex idx)
+void Wheels4_SetAll(int16_t fl, int16_t fr, int16_t rl, int16_t rr)
 {
-    Wheel_t *w = &g_wheels[idx];
-
-    uint16_t now = (uint16_t)w->enc_tim->CNT;
-    int16_t delta = (int16_t)(now - w->enc_prev);
-    w->enc_acc += (int32_t)delta;
-    w->enc_prev = now;
-
-    return w->enc_acc;
+  Wheel_SetSignedSpeed(W_FL, fl);
+  Wheel_SetSignedSpeed(W_FR, fr);
+  Wheel_SetSignedSpeed(W_RL, rl);
+  Wheel_SetSignedSpeed(W_RR, rr);
 }
 
-/* ---------------- High-level motions (differential drive) ----------------
-   Convention:
-     Left side:  FL + RL
-     Right side: FR + RR
-*/
-void Drive_Stop(void)
+void Wheels4_Stop(void)
 {
-    for (int i=0;i<4;i++) Wheel_SetSignedSpeed((WheelIndex)i, 0);
+  Wheels4_SetAll(0,0,0,0);
+  g_last_ms = HAL_GetTick();
 }
 
-void Drive_Forward(int16_t cmd)
+static void handle_line(const char *s, uint32_t now_ms)
 {
-    Wheel_SetSignedSpeed(W_FL, +cmd);
-    Wheel_SetSignedSpeed(W_RL, +cmd);
-    Wheel_SetSignedSpeed(W_FR, +cmd);
-    Wheel_SetSignedSpeed(W_RR, +cmd);
+  if (!s || !s[0]) return;
+
+  if (s[0] == 'M') {
+    int a,b,c,d;
+    if (sscanf(s, "M %d %d %d %d", &a, &b, &c, &d) == 4) {
+      a = clamp_i(a, -1000, 1000);
+      b = clamp_i(b, -1000, 1000);
+      c = clamp_i(c, -1000, 1000);
+      d = clamp_i(d, -1000, 1000);
+      Wheels4_SetAll((int16_t)a,(int16_t)b,(int16_t)c,(int16_t)d);
+      g_last_ms = now_ms;
+    }
+    return;
+  }
+
+  if (s[0] == 'X') {
+    Wheels4_Stop();
+    return;
+  }
 }
 
-void Drive_Reverse(int16_t cmd)
+void Wheels4_Task(uint32_t now_ms)
 {
-    Wheel_SetSignedSpeed(W_FL, -cmd);
-    Wheel_SetSignedSpeed(W_RL, -cmd);
-    Wheel_SetSignedSpeed(W_FR, -cmd);
-    Wheel_SetSignedSpeed(W_RR, -cmd);
-}
+  if ((now_ms - g_last_ms) > DRIVE_TIMEOUT_MS) {
+    Wheels4_Stop();
+  }
 
-void Drive_TurnLeft(int16_t cmd)
-{
-    // pivot turn: left wheels reverse, right wheels forward
-    Wheel_SetSignedSpeed(W_FL, -cmd);
-    Wheel_SetSignedSpeed(W_RL, -cmd);
-    Wheel_SetSignedSpeed(W_FR, +cmd);
-    Wheel_SetSignedSpeed(W_RR, +cmd);
-}
+  if (g_ready) {
+    char local[LINE_BUF_SZ];
 
-void Drive_TurnRight(int16_t cmd)
-{
-    Wheel_SetSignedSpeed(W_FL, +cmd);
-    Wheel_SetSignedSpeed(W_RL, +cmd);
-    Wheel_SetSignedSpeed(W_FR, -cmd);
-    Wheel_SetSignedSpeed(W_RR, -cmd);
-}
+    __disable_irq();
+    int n = g_len;
+    if (n >= LINE_BUF_SZ) n = LINE_BUF_SZ - 1;
+    memcpy(local, (const void*)g_line, (size_t)n);
+    local[n] = '\0';
+    g_len = 0;
+    g_ready = 0;
+    __enable_irq();
 
+    handle_line(local, now_ms);
+  }
+}
