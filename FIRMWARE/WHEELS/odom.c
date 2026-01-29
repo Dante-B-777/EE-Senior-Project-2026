@@ -1,60 +1,20 @@
 /**
  * @file    odom4.c
- * @brief   Four-wheel differential-drive odometry estimation module
+ * @brief   Four-wheel skid-steer/differential-drive odometry estimation
  *
- * This file implements planar odometry for a four-wheel skid-steer robot
- * using incremental quadrature encoder feedback from each wheel.
+ * Outputs pose (x,y,theta) and velocities (v,w) from four encoder timers.
+ * Left distance = average(FL, RL), Right distance = average(FR, RR).
  *
- * The robot pose is estimated in a 2D world frame (x, y, θ), where:
- *   - x and y represent the robot’s position in meters
- *   - θ represents the robot’s heading in radians
- *   - the initial pose (x = 0, y = 0, θ = 0) corresponds to the robot’s
- *     position and orientation at the moment logging begins or when
- *     Odom4_Reset() is called
- *
- * Encoder counts from the front-left (FL), front-right (FR),
- * rear-left (RL), and rear-right (RR) wheels are read using STM32
- * hardware timers configured in Encoder Interface mode. Wheel travel
- * distances are computed from encoder count deltas using known wheel
- * geometry and encoder resolution.
- *
- * For odometry computation, the robot is modeled as a differential-drive
- * system by averaging the left-side wheels (FL, RL) and right-side wheels
- * (FR, RR). Linear and angular displacements are then integrated using a
- * midpoint (semi-implicit) integration method to improve accuracy during
- * turning maneuvers.
- *
- * Assumptions:
- *   - Planar motion (no slip, no vertical motion)
- *   - Identical wheel radii for all four wheels
- *   - Left and right wheels remain parallel
- *   - Encoder timers are updated frequently enough to avoid overflow
- *
- * Robot parameters used in this project:
- *   - Wheel radius: 52 mm (0.052 m)
- *   - Track width: 415 mm (0.415 m)
- *   - Encoder resolution: ~537.7 pulses per wheel revolution at the
- *     gearbox output, with 4x quadrature decoding
- *
- * This module is intended to be called periodically (e.g., 50–200 Hz)
- * from the main control loop. The resulting pose estimate may be used
- * for navigation, control, telemetry, or sensor fusion.
- *
- * @author
- * Dante Benedetti
- *
- * @date
- * 2026
+ * Serial telemetry helper produces:
+ *   O x y th v w\n
  */
 
 #include "odom4.h"
 #include <math.h>
+#include <stdio.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
-#define WHEEL_RADIUS_M   0.052f
-#define TRACK_WIDTH_M    0.415f
-#define COUNTS_PER_REV   (537.7f * 4.0f)   // encoder mode usually counts 4x
 #endif
 
 static float wrap_pi(float a) {
@@ -63,14 +23,27 @@ static float wrap_pi(float a) {
   return a;
 }
 
-// Read counter and compute delta robustly for 16-bit encoder timers.
-// If you use a 32-bit timer, this still works as long as you update often enough.
-static inline int32_t delta_from_16bit(TIM_HandleTypeDef *htim, int32_t *prev) {
-  int16_t cur16 = (int16_t)__HAL_TIM_GET_COUNTER(htim);
-  int16_t prev16 = (int16_t)(*prev);
-  int16_t d16 = (int16_t)(cur16 - prev16);     // handles wrap automatically for 16-bit
-  *prev = (int32_t)cur16;
-  return (int32_t)d16;
+/**
+ * Robust delta for any timer width, using ARR for modulo wrap.
+ * Assumes the counter runs 0..ARR and wraps.
+ *
+ * Works for both 16-bit and 32-bit timers as long as ARR matches the configured period.
+ * Update rate should be fast enough that delta never exceeds +/- ARR/2 counts per update.
+ */
+static inline int32_t delta_mod(TIM_HandleTypeDef *htim, int32_t *prev)
+{
+  uint32_t cur = __HAL_TIM_GET_COUNTER(htim);
+  uint32_t arr = __HAL_TIM_GET_AUTORELOAD(htim);
+  uint32_t mod = arr + 1u;
+
+  int32_t d = (int32_t)(cur - (uint32_t)(*prev));
+
+  // wrap to [-mod/2, mod/2)
+  if (d >  (int32_t)(mod / 2u)) d -= (int32_t)mod;
+  if (d < -(int32_t)(mod / 2u)) d += (int32_t)mod;
+
+  *prev = (int32_t)cur;
+  return d;
 }
 
 void Odom4_Init(Odom4_t *o,
@@ -82,6 +55,8 @@ void Odom4_Init(Odom4_t *o,
                 float track_width_m,
                 float counts_per_rev)
 {
+  if (!o) return;
+
   o->enc_fl = enc_fl;
   o->enc_fr = enc_fr;
   o->enc_rl = enc_rl;
@@ -95,18 +70,26 @@ void Odom4_Init(Odom4_t *o,
   o->y_m = 0.0f;
   o->theta_rad = 0.0f;
 
-  // start encoder timers if not already started elsewhere
-  // (safe to call even if you started them in main)
-  HAL_TIM_Encoder_Start(o->enc_fl, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(o->enc_fr, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(o->enc_rl, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(o->enc_rr, TIM_CHANNEL_ALL);
+  o->v_mps = 0.0f;
+  o->w_rps = 0.0f;
 
-  // zero previous counts to current counter values
-  o->prev_fl = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_fl);
-  o->prev_fr = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_fr);
-  o->prev_rl = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_rl);
-  o->prev_rr = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_rr);
+  // default signs: +1 (flip to -1 after a quick empirical test if needed)
+  o->sign_fl =  1;
+  o->sign_fr =  1;
+  o->sign_rl =  1;
+  o->sign_rr =  1;
+
+  // start encoder timers (safe even if already started)
+  if (o->enc_fl) HAL_TIM_Encoder_Start(o->enc_fl, TIM_CHANNEL_ALL);
+  if (o->enc_fr) HAL_TIM_Encoder_Start(o->enc_fr, TIM_CHANNEL_ALL);
+  if (o->enc_rl) HAL_TIM_Encoder_Start(o->enc_rl, TIM_CHANNEL_ALL);
+  if (o->enc_rr) HAL_TIM_Encoder_Start(o->enc_rr, TIM_CHANNEL_ALL);
+
+  // initialize prev counts to current
+  o->prev_fl = o->enc_fl ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_fl) : 0;
+  o->prev_fr = o->enc_fr ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_fr) : 0;
+  o->prev_rl = o->enc_rl ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_rl) : 0;
+  o->prev_rr = o->enc_rr ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_rr) : 0;
 
   o->last_ms = HAL_GetTick();
   o->initialized = 1;
@@ -114,35 +97,45 @@ void Odom4_Init(Odom4_t *o,
 
 void Odom4_Reset(Odom4_t *o)
 {
+  if (!o || !o->initialized) return;
+
   o->x_m = 0.0f;
   o->y_m = 0.0f;
   o->theta_rad = 0.0f;
 
-  // re-zero delta accumulation to “now”
-  o->prev_fl = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_fl);
-  o->prev_fr = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_fr);
-  o->prev_rl = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_rl);
-  o->prev_rr = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(o->enc_rr);
+  o->v_mps = 0.0f;
+  o->w_rps = 0.0f;
+
+  o->prev_fl = o->enc_fl ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_fl) : 0;
+  o->prev_fr = o->enc_fr ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_fr) : 0;
+  o->prev_rl = o->enc_rl ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_rl) : 0;
+  o->prev_rr = o->enc_rr ? (int32_t)__HAL_TIM_GET_COUNTER(o->enc_rr) : 0;
 
   o->last_ms = HAL_GetTick();
 }
 
 void Odom4_Update(Odom4_t *o, uint32_t now_ms)
 {
-  if (!o->initialized) return;
+  if (!o || !o->initialized) return;
 
-  // dt is optional for pose integration, but it’s nice to keep for debugging/velocity later
   uint32_t dt_ms = now_ms - o->last_ms;
-  if (dt_ms == 0) return;
+  if (dt_ms == 0u) return;
   o->last_ms = now_ms;
 
-  // encoder count deltas
-  int32_t d_fl = delta_from_16bit(o->enc_fl, &o->prev_fl);
-  int32_t d_fr = delta_from_16bit(o->enc_fr, &o->prev_fr);
-  int32_t d_rl = delta_from_16bit(o->enc_rl, &o->prev_rl);
-  int32_t d_rr = delta_from_16bit(o->enc_rr, &o->prev_rr);
+  // encoder deltas (counts)
+  int32_t d_fl = o->enc_fl ? delta_mod(o->enc_fl, &o->prev_fl) : 0;
+  int32_t d_fr = o->enc_fr ? delta_mod(o->enc_fr, &o->prev_fr) : 0;
+  int32_t d_rl = o->enc_rl ? delta_mod(o->enc_rl, &o->prev_rl) : 0;
+  int32_t d_rr = o->enc_rr ? delta_mod(o->enc_rr, &o->prev_rr) : 0;
 
-  // Convert counts -> meters (per wheel)
+  // apply sign corrections
+  d_fl *= (int32_t)o->sign_fl;
+  d_fr *= (int32_t)o->sign_fr;
+  d_rl *= (int32_t)o->sign_rl;
+  d_rr *= (int32_t)o->sign_rr;
+
+  // counts -> meters
+  // meters_per_count = (2*pi*R) / counts_per_rev
   float meters_per_count = (2.0f*(float)M_PI*o->wheel_radius_m) / o->counts_per_rev;
 
   float s_fl = meters_per_count * (float)d_fl;
@@ -150,16 +143,34 @@ void Odom4_Update(Odom4_t *o, uint32_t now_ms)
   float s_rl = meters_per_count * (float)d_rl;
   float s_rr = meters_per_count * (float)d_rr;
 
-  // Skid-steer approximation: average left vs average right
+  // left vs right average
   float s_left  = 0.5f * (s_fl + s_rl);
   float s_right = 0.5f * (s_fr + s_rr);
 
+  // incremental motion
   float ds     = 0.5f * (s_left + s_right);
   float dtheta = (s_right - s_left) / o->track_width_m;
 
-  // Midpoint integration (better than naive Euler for turning)
+  // midpoint integration
   float theta_mid = o->theta_rad + 0.5f * dtheta;
-  o->x_m     += ds * cosf(theta_mid);
-  o->y_m     += ds * sinf(theta_mid);
-  o->theta_rad = wrap_pi(o->theta_rad + dtheta);
+  o->x_m       += ds * cosf(theta_mid);
+  o->y_m       += ds * sinf(theta_mid);
+  o->theta_rad  = wrap_pi(o->theta_rad + dtheta);
+
+  // velocities
+  float dt = (float)dt_ms * 1e-3f;
+  o->v_mps = ds / dt;
+  o->w_rps = dtheta / dt;
+}
+
+int Odom4_FormatTelemetry(const Odom4_t *o, char *buf, size_t buf_sz)
+{
+  if (!o || !buf || buf_sz < 8) return -1;
+  // "O x y th v w\n"
+  // Keep it compact but readable.
+  int n = snprintf(buf, buf_sz, "O %.4f %.4f %.4f %.3f %.3f\n",
+                   (double)o->x_m, (double)o->y_m, (double)o->theta_rad,
+                   (double)o->v_mps, (double)o->w_rps);
+  if (n < 0 || (size_t)n >= buf_sz) return -1;
+  return n;
 }
